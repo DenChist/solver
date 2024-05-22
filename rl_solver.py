@@ -68,7 +68,7 @@ class FFSSEnv(gym.Env):
             operation_due_dates = self.due_dates - remaining_processing_times
             job = np.argmin(operation_due_dates)
         elif rule == 4:  # SRP
-            job = np.argmin(remaining_processing_times)
+            job = np.argmin(self.processing_times.sum(axis=1))
         elif rule == 5:  # LNP
             job = np.argmax(next_stage_processing_times)
         elif rule == 6:  # SNP
