@@ -1,98 +1,122 @@
+import gymnasium as gym
+from gymnasium import spaces
 import numpy as np
-import gym
-from stable_baselines3 import PPO
 
-class ProductionEnv(gym.Env):
-    def __init__(self, n_tasks, n_stages, machines_per_stage, processing_times, deadlines):
-        super(ProductionEnv, self).__init__()
-        self.n_tasks = n_tasks
+class FFSSEnv(gym.Env):
+    def __init__(self, n_jobs, n_stages, machines, processing_times, due_dates):
+        super(FFSSEnv, self).__init__()
+        self.n_jobs = n_jobs
         self.n_stages = n_stages
-        self.machines_per_stage = machines_per_stage
+        self.machines = machines
         self.processing_times = processing_times
-        self.deadlines = deadlines
+        self.due_dates = due_dates
         
-        self.action_space = gym.spaces.Discrete(14)
-        self.observation_space = gym.spaces.Box(low=0, high=np.inf, shape=(n_tasks, n_stages, max(machines_per_stage)), dtype=np.float32)
+        self.action_space = spaces.Discrete(14)
         
-        self.current_stage = 0
+        self.observation_space = spaces.Box(
+            low=0, high=np.inf, shape=(n_jobs, n_stages + 1), dtype=np.float32)
+        
+        self.reset()
 
-    def reset(self):
-        self.state = np.zeros((self.n_tasks, self.n_stages, max(self.machines_per_stage)))
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.job_completion_times = np.zeros((self.n_jobs, self.n_stages), dtype=np.float32)
+        self.machine_available_times = np.zeros((self.n_stages, max(self.machines)), dtype=np.float32)
         self.current_time = 0
-        self.task_completion = np.zeros(self.n_tasks)
-        self.machine_availability = np.zeros((self.n_stages, max(self.machines_per_stage)))
-        self.current_stage = 0
-        return self.state
+        return self.get_state(), {}
+
+    def get_state(self):
+        return np.hstack((self.job_completion_times, self.due_dates[:, None].astype(np.float32)))
 
     def step(self, action):
-        task, stage, machine = self.select_task_and_machine(action)
-        reward, done = self.process_task(task, stage, machine)
+        job_selection_rule = action // 2
+        machine_selection_rule = action % 2
         
-        self.state[task, stage, machine] = 1
-        self.current_time = max(self.current_time, self.machine_availability[stage, machine]) + self.processing_times[task, stage]
-        self.task_completion[task] = max(self.task_completion[task], self.current_time)
-        self.machine_availability[stage, machine] = self.current_time
+        job = self.select_job(job_selection_rule)
+        stage = self.select_stage(job)
+        machine = self.select_machine(machine_selection_rule, stage)
         
-        if np.all(self.state[:, stage, :] == 1):
-            self.current_stage = min(self.current_stage + 1, self.n_stages - 1)
+        start_time = max(self.machine_available_times[stage][machine], self.current_time)
+        processing_time = self.processing_times[job][stage]
+        completion_time = start_time + processing_time
         
-        done = self.current_stage == self.n_stages - 1 and np.all(self.state[:, -1, :] == 1)
-        return self.state, reward, done, {}
+        self.job_completion_times[job][stage] = completion_time
+        self.machine_available_times[stage][machine] = completion_time
+        self.current_time = completion_time
+        
+        Cmax = np.max(self.job_completion_times[:, -1])
+        T = np.sum(np.maximum(self.job_completion_times[:, -1] - self.due_dates, 0))
+        reward = -0.01 * (Cmax + T)
+        
+        done = np.all(self.job_completion_times[:, -1] > 0)
+        terminated = bool(done)
+        truncated = False
+        
+        return self.get_state(), reward, terminated, truncated, {}
 
-    def select_task_and_machine(self, action):
-        task_rule = action // 2
-        machine_rule = action % 2
-        task = self.select_task(self.current_stage, task_rule)
-        machine = self.select_machine(self.current_stage, machine_rule)
-        return task, self.current_stage, machine
+    def select_job(self, rule):
+        remaining_processing_times = np.sum(self.processing_times - self.job_completion_times, axis=1)
+        next_stage_processing_times = self.processing_times[:, np.argmin(self.job_completion_times, axis=1)]
+        
+        if rule == 0:  # SPT
+            job = np.argmin(remaining_processing_times)
+        elif rule == 1:  # LPT
+            job = np.argmax(remaining_processing_times)
+        elif rule == 2:  # EDD
+            job = np.argmin(self.due_dates)
+        elif rule == 3:  # ODD
+            operation_due_dates = self.due_dates - remaining_processing_times
+            job = np.argmin(operation_due_dates)
+        elif rule == 4:  # SRP
+            job = np.argmin(remaining_processing_times)
+        elif rule == 5:  # LNP
+            job = np.argmax(next_stage_processing_times)
+        elif rule == 6:  # SNP
+            job = np.argmin(next_stage_processing_times)
+        
+        job = min(max(job, 0), self.n_jobs - 1)
+        return job
 
-    def select_task(self, stage, rule_index):
-        if rule_index == 0:
-            return np.argmin(self.processing_times[:, stage])  # SPT
-        elif rule_index == 1:
-            return np.argmax(self.processing_times[:, stage])  # LPT
-        elif rule_index == 2:
-            return np.argmin(self.deadlines)  # EDD
-        elif rule_index == 3:
-            return np.argmin(self.deadlines / self.processing_times.sum(axis=1))  # ODD
-        elif rule_index == 4:
-            return np.argmin(self.processing_times.sum(axis=1))  # SRP
-        elif rule_index == 5:
-            return np.argmax(self.processing_times[:, (stage + 1) % self.n_stages])  # LNP
-        elif rule_index == 6:
-            return np.argmin(self.processing_times[:, (stage + 1) % self.n_stages])  # SNP
-        else:
-            raise ValueError("Invalid rule index")
+    def select_stage(self, job):
+        for stage in range(self.n_stages):
+            if self.job_completion_times[job][stage] == 0:
+                return stage
+        return self.n_stages - 1
 
-    def select_machine(self, stage, rule_index):
-        if rule_index == 0:
-            return np.argmin(self.machine_availability[stage, :self.machines_per_stage[stage]])  # FCFS
-        elif rule_index == 1:
-            return np.argmin(self.machine_availability[stage, :self.machines_per_stage[stage]].sum(axis=0))  # WINQ
-        else:
-            raise ValueError("Invalid rule index")
+    def select_machine(self, rule, stage):
+        if rule == 0:  # FCFS
+            machine = np.argmin(self.machine_available_times[stage])
+        elif rule == 1:  # WINQ
+            machine = np.argmin(np.sum(self.machine_available_times, axis=1))
+        
+        machine = min(max(machine, 0), len(self.machine_available_times[stage]) - 1)
+        return machine
 
-    def process_task(self, task, stage, machine):
-        processing_time = self.processing_times[task, stage]
-        self.machine_availability[stage, machine] += processing_time
-        reward = - (np.max(self.task_completion) + np.sum(np.maximum(self.task_completion - self.deadlines, 0)))
-        done = np.all(self.task_completion > 0)
-        return reward, done
-
-n_tasks = 5
+n_jobs = 5
 n_stages = 3
-machines_per_stage = [3, 2, 3]
-processing_times = np.random.randint(20, 100, (n_tasks, n_stages))
-deadlines = np.random.randint(200, 300, n_tasks)
+machines = [2, 2, 2]
+processing_times = np.random.randint(1, 10, (n_jobs, n_stages)).astype(np.float32)
+due_dates = np.random.randint(10, 20, n_jobs).astype(np.float32)
+env = FFSSEnv(n_jobs, n_stages, machines, processing_times, due_dates)
 
-env = ProductionEnv(n_tasks, n_stages, machines_per_stage, processing_times, deadlines)
+from stable_baselines3.common.env_checker import check_env
+check_env(env)
 
-model = PPO("MlpPolicy", env, verbose=1)
+from stable_baselines3 import DQN
+from stable_baselines3.dqn import MlpPolicy
+
+model = DQN(MlpPolicy, env, verbose=1, learning_rate=1e-3, buffer_size=50000, learning_starts=1000, batch_size=32, tau=1.0, gamma=0.99, train_freq=4, gradient_steps=1, target_update_interval=100, exploration_fraction=0.1, exploration_final_eps=0.02, max_grad_norm=10)
 model.learn(total_timesteps=100000)
 
-obs = env.reset()
-done = False
-while not done:
-    action, _states = model.predict(obs)
-    obs, rewards, done, info = env.step(action)
-    print(f"Action: {action}, Reward: {rewards}, Done: {done}")
+model.save("d3qn_ffss")
+
+model = DQN.load("d3qn_ffss")
+
+obs, _ = env.reset()
+for _ in range(n_jobs * n_stages):
+    action, _states = model.predict(obs, deterministic=True)
+    obs, rewards, terminated, truncated, _ = env.step(action)
+    if terminated:
+        break
+
+print("Finished with reward:", rewards)
