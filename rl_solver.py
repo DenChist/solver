@@ -2,6 +2,10 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
+from stable_baselines3.common.env_checker import check_env
+from stable_baselines3 import DQN
+from stable_baselines3.dqn import MlpPolicy
+
 class FFSSEnv(gym.Env):
     def __init__(self, n_jobs, n_stages, machines, processing_times, due_dates):
         super(FFSSEnv, self).__init__()
@@ -46,14 +50,22 @@ class FFSSEnv(gym.Env):
         
         Cmax = np.max(self.job_completion_times[:, -1])
         T = np.sum(np.maximum(self.job_completion_times[:, -1] - self.due_dates, 0))
-        reward = -0.01 * (Cmax + T)
+        reward = -1.0 * (Cmax + T)
         
         done = np.all(self.job_completion_times[:, -1] > 0)
         terminated = bool(done)
         truncated = False
         
         return self.get_state(), reward, terminated, truncated, {}
+    
+    def select_stage(self, job):
+        for stage in range(self.n_stages):
+            if self.job_completion_times[job][stage] == 0:
+                return stage
+        return self.n_stages - 1
+    
 
+    
     def select_job(self, rule):
         remaining_processing_times = np.sum(self.processing_times - self.job_completion_times, axis=1)
         next_stage_processing_times = self.processing_times[:, np.argmin(self.job_completion_times, axis=1)]
@@ -77,12 +89,6 @@ class FFSSEnv(gym.Env):
         job = min(max(job, 0), self.n_jobs - 1)
         return job
 
-    def select_stage(self, job):
-        for stage in range(self.n_stages):
-            if self.job_completion_times[job][stage] == 0:
-                return stage
-        return self.n_stages - 1
-
     def select_machine(self, rule, stage):
         if rule == 0:  # FCFS
             machine = np.argmin(self.machine_available_times[stage])
@@ -92,6 +98,8 @@ class FFSSEnv(gym.Env):
         machine = min(max(machine, 0), len(self.machine_available_times[stage]) - 1)
         return machine
 
+
+
 n_jobs = 5
 n_stages = 3
 machines = [2, 2, 2]
@@ -99,11 +107,7 @@ processing_times = np.random.randint(1, 10, (n_jobs, n_stages)).astype(np.float3
 due_dates = np.random.randint(10, 20, n_jobs).astype(np.float32)
 env = FFSSEnv(n_jobs, n_stages, machines, processing_times, due_dates)
 
-from stable_baselines3.common.env_checker import check_env
 check_env(env)
-
-from stable_baselines3 import DQN
-from stable_baselines3.dqn import MlpPolicy
 
 model = DQN(MlpPolicy, env, verbose=1, learning_rate=1e-3, buffer_size=50000, learning_starts=1000, batch_size=32, tau=1.0, gamma=0.99, train_freq=4, gradient_steps=1, target_update_interval=100, exploration_fraction=0.1, exploration_final_eps=0.02, max_grad_norm=10)
 model.learn(total_timesteps=100000)
